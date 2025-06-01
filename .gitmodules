@@ -1,3 +1,6 @@
 [submodule "flatcc"]
 	path = flatcc
 	url = https://github.com/dvidelabs/flatcc.git
+[submodule "flatbuffers"]
+	path = flatbuffers
+	url = https://github.com/google/flatbuffers.git
