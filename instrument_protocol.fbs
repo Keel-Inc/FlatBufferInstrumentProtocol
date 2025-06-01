@@ -1,0 +1,41 @@
+// Medical Instrument Protocol Schema
+// This schema defines the communication protocol between an embedded medical instrument
+// and its host application using FlatBuffers for efficient serialization.
+
+namespace InstrumentProtocol;
+
+// Command codes for instrument control
+enum CommandCode : byte {
+    Start = 0,
+    Stop = 1
+}
+
+// Command message for starting/stopping the instrument
+table Command {
+    code: CommandCode;
+}
+
+// Configuration message for setting instrument parameters
+table Configuration {
+    measurements_per_second: uint32;
+    samples_per_measurement: uint32;
+}
+
+// Measurement data from the instrument
+table Measurement {
+    data: [float];
+}
+
+// Union of all possible message types
+union MessageType {
+    Command,
+    Configuration,
+    Measurement
+}
+
+// Root message container
+table Message {
+    message_type: MessageType;
+}
+
+root_type Message; 

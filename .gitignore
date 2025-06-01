@@ -1,0 +1,132 @@
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+Testing/
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+_deps/
+build/
+out/
+
+# Visual Studio
+.vs/
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.VC.opendb
+ipch/
+x64/
+x86/
+obj/
+bin/
+Win32/
+Debug/
+Release/
+MinSizeRel/
+RelWithDebInfo/
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# C/C++ artifacts
+*.o
+*.obj
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.map
+*.exp
+*.idb
+*.res
+*.rc.h
+*.sbr
+*.bsc
+*.ncb
+*.aps
+*.clw
+*.tmp
+*.log
+
+# Temporary files
+*~
+*.swp
+*.swo
+*tmp*
+temp/
+tmp/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.stackdump
+
+# Package managers
+vcpkg_installed/
+conan/
+.conan/
+
+# FlatBuffers generated files
+*_generated.h
+*_generated.cpp
+
+# Doxygen documentation
+docs/html/
+docs/latex/
+
+# Unit test results
+test_results/
+*.xml
+*.trx
+
+# Coverage reports
+*.coverage
+coverage/
+
+# Profiling data
+*.psess
+*.vsp
+*.vspx
+
+# Intel C++ Compiler
+*.dpi
+
+# Intel Inspector
+*.tlog
+
+# Qt
+*.pro.user
+*.pro.user.*
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+*.qm
+
+# IDE specific files
+*.sublime-*
+*.idea/
+
+# Archive files
+*.zip
+*.tar.gz
+*.7z
+*.rar
