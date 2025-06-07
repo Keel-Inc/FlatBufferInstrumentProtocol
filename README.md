@@ -12,6 +12,13 @@ The protocol defines three message types:
 2. Configuration Messages: Set instrument parameters (sampling rate, samples per measurement)  
 3. Measurement Messages: Transmit variable-length measurement data
 
+### Supported Transports
+
+The Host application supports two communication transports:
+
+- Named Pipes
+- TCP Sockets
+
 ## Build
 
 ```powershell
@@ -46,7 +53,10 @@ dotnet build --configuration Release
 dotnet test
 cd ..
 ```
+
 ## Usage
+
+### Using Named Pipes
 
 Start the instrument application:
 ```powershell
@@ -58,4 +68,14 @@ Then start the host in a separate terminal:
 ```powershell
 cd Host
 dotnet run
+# or explicitly:
+dotnet run --connection NamedPipe
+```
+
+### Using TCP Sockets
+
+Start the host with TCP connection:
+```powershell
+cd Host
+dotnet run --connection TcpSocket --host localhost --port 1234
 ```
