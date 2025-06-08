@@ -87,7 +87,8 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   /* USER CODE BEGIN 2 */
-
+  initialise_monitor_handles();
+  printf("Bootup complete\n\r");
   /* USER CODE END 2 */
 
   /* Infinite loop */

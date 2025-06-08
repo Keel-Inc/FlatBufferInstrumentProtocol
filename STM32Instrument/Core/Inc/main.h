@@ -28,6 +28,8 @@ extern "C" {
 
 /* Includes ------------------------------------------------------------------*/
 #include "stm32f1xx_hal.h"
+#include <stdio.h>
+extern void initialise_monitor_handles(void);
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */

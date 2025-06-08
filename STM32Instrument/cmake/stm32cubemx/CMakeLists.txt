@@ -53,7 +53,6 @@ set(MX_LINK_DIRS
 # Project static libraries
 set(MX_LINK_LIBS 
     STM32_Drivers
-    
 )
 # Interface library for includes and symbols
 add_library(stm32cubemx INTERFACE)
