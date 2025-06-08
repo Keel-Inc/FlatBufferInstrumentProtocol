@@ -12,6 +12,10 @@ _deps/
 build/
 out/
 
+# Ninja
+build.ninja
+
+
 # Visual Studio
 .vs/
 *.vcxproj
