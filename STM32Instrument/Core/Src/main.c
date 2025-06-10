@@ -43,7 +43,7 @@
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-
+uint8_t rx_buffer[1];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -101,6 +101,10 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    if (HAL_UART_Receive(&huart1, rx_buffer, 1, 100) == HAL_OK) {
+      printf("%c\r\n", (rx_buffer[0] >= ' ' && rx_buffer[0] <= '~') ? rx_buffer[0] : '.');
+      HAL_UART_Transmit(&huart1, rx_buffer, 1, 100);
+    }
   }
   /* USER CODE END 3 */
 }
