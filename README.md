@@ -22,19 +22,39 @@ The Host application supports two communication transports:
 ## Build
 
 ```powershell
-# Build flacc for MSCV
+# Build flatcc for MSCV
 cd flatcc\build\MSCV
 cmake -G "Visual Studio 17 2022" ..\..
 & "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" -p:Configuration=Release FlatCC.sln
 cd ..\..\..
 
-# Generate the C bindings
+# Generate the MSVC bindings
 flatcc\bin\Release\flatcc.exe -a -o MsvcInstrument\InstrumentProtocol instrument_protocol.fbs
+
+# Build flatcc for ARM
+flatcc\build\ARM
+cmake -G "Ninja" `
+  -DCMAKE_TOOLCHAIN_FILE="..\..\..\STM32Instrument\cmake\gcc-arm-none-eabi.cmake" `
+  -DCMAKE_C_FLAGS_INIT="-mcpu=cortex-m33 -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb" `
+  -DFLATCC_RTONLY=ON `
+  -DCMAKE_BUILD_TYPE=Release `
+  ..\..\
+cmake --build .
+cd ..\..\..
+
+# Generate STM32 C bindings
+flatcc\bin\Release\flatcc.exe -a -o STM32Instrument\InstrumentProtocol instrument_protocol.fbs
 
 # Build the MSCV instrument application
 cd MsvcInstrument
 cmake -G "Visual Studio 17 2022" -B build
 cmake --build build --config Release
+cd ..
+
+# Build the STM32 instrument application
+cd ~\Src\FlatbufferInstrumentProtocol\STM32Instrument
+cmake --preset RelWithDebInfo
+cmake --build build/RelWithDebInfo
 cd ..
 
 # Build flatbuffers for C#
@@ -43,7 +63,7 @@ cmake -G "Visual Studio 17 2022" -DCMAKE_BUILD_TYPE=Release
 & "C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe" -p:Configuration=Release .\FlatBuffers.sln
 cd ..
 
-# Generate the C# bindings, then 
+# Generate the C# bindings
 flatbuffers\Release\flatc.exe --csharp -o Host instrument_protocol.fbs
 
 # Build the host application
@@ -73,6 +93,17 @@ dotnet run --connection NamedPipe
 ```
 
 ### Using TCP Sockets
+
+Start QEMU with TCP serial redirection:
+```powershell
+qemu-system-arm `
+	-cpu cortex-m3 `
+	-machine stm32vldiscovery `
+	-nographic `
+	-semihosting-config enable=on,target=native `
+	-device loader,file=build/RelWithDebInfo/STM32Instrument.elf,addr=0x8000000 `
+	-serial tcp::1234,server,nowait
+```
 
 Start the host with TCP connection:
 ```powershell

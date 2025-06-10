@@ -21,7 +21,10 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "instrument_protocol_reader.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -43,7 +46,11 @@
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-uint8_t rx_buffer[1];
+#define RX_BUFFER_SIZE 1024
+uint8_t rx_buffer[RX_BUFFER_SIZE];
+uint16_t rx_index = 0;
+bool message_size_received = false;
+uint32_t expected_message_size = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -56,6 +63,76 @@ static void MX_USART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// Log received packet information (simplified for now)
+void log_received_packet(void* buffer, size_t size) {
+    // Check for minimum size-prefixed buffer size
+    if (size < sizeof(uint32_t) + 4) { // 4 bytes for size prefix + minimum FlatBuffer
+        printf("Error: Received buffer too small (%u bytes) for size-prefixed message\r\n", size);
+        return;
+    }
+    
+    // Read the size prefix (first 4 bytes)
+    uint32_t message_size = *(uint32_t*)buffer;
+    
+    // Validate size prefix
+    if (sizeof(uint32_t) + message_size > size) {
+        printf("Error: Size prefix (%lu) exceeds available data (%u bytes total)\r\n", 
+               message_size, size);
+        return;
+    }
+    
+    // Skip the size prefix to get to the actual FlatBuffer message
+    void* message_buffer = (uint8_t*)buffer + sizeof(uint32_t);
+    
+    // Parse the message (now without the size prefix)
+    InstrumentProtocol_Message_table_t message = InstrumentProtocol_Message_as_root(message_buffer);
+    if (!message) {
+        printf("Error: Failed to parse size-prefixed message\r\n");
+        return;
+    }
+    
+    // Get message type
+    InstrumentProtocol_MessageType_union_t message_type = InstrumentProtocol_Message_message_type_union(message);
+    
+    // Log based on message type
+    switch (message_type.type) {
+        case InstrumentProtocol_MessageType_Command:
+            printf("Received Command message\r\n");
+            break;
+            
+        case InstrumentProtocol_MessageType_Configuration:
+            printf("Received Configuration message\r\n");
+            break;
+            
+        case InstrumentProtocol_MessageType_Measurement:
+            printf("Received Measurement message\r\n");
+            break;
+            
+        default:
+            printf("Received Unknown message type: %u\r\n", message_type.type);
+            break;
+    }
+}
+
+// Process received bytes for flatbuffer messages
+void process_received_bytes(void) {
+    // If we haven't received the size prefix yet
+    if (!message_size_received && rx_index >= sizeof(uint32_t)) {
+        expected_message_size = *(uint32_t*)rx_buffer;
+        message_size_received = true;
+    }
+    
+    // If we have the complete message (size prefix + message data)
+    if (message_size_received && rx_index >= sizeof(uint32_t) + expected_message_size) {
+        log_received_packet(rx_buffer, sizeof(uint32_t) + expected_message_size);
+        
+        // Reset for next message
+        rx_index = 0;
+        message_size_received = false;
+        expected_message_size = 0;
+    }
+}
 
 /* USER CODE END 0 */
 
@@ -91,7 +168,8 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   initialise_monitor_handles();
-  printf("Bootup complete\n\r");
+  printf("STM32 Instrument v1.0 - FlatBuffer Protocol\r\n");
+  printf("Ready to receive FlatBuffer messages...\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -101,9 +179,22 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if (HAL_UART_Receive(&huart1, rx_buffer, 1, 100) == HAL_OK) {
-      printf("%c\r\n", (rx_buffer[0] >= ' ' && rx_buffer[0] <= '~') ? rx_buffer[0] : '.');
-      HAL_UART_Transmit(&huart1, rx_buffer, 1, 100);
+    uint8_t byte;
+    if (HAL_UART_Receive(&huart1, &byte, 1, 100) == HAL_OK) {
+      // Check for buffer overflow
+      if (rx_index >= RX_BUFFER_SIZE) {
+        printf("Error: RX buffer overflow, resetting\r\n");
+        rx_index = 0;
+        message_size_received = false;
+        expected_message_size = 0;
+        continue;
+      }
+      
+      // Add byte to buffer
+      rx_buffer[rx_index++] = byte;
+      
+      // Process received bytes to check for complete messages
+      process_received_bytes();
     }
   }
   /* USER CODE END 3 */
