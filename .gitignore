@@ -65,6 +65,7 @@ RelWithDebInfo/
 *.clw
 *.tmp
 *.log
+*.elf
 
 # Temporary files
 *~
