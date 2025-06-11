@@ -174,7 +174,7 @@ public class InstrumentHostTests
         Assert.Equal(buffer1, buffer2);
     }
 
-    // NEW TESTS FOR DATA PARSING EDGE CASES
+    // NEW TESTS FOR FRAGMENTED DATA HANDLING
 
     [Fact]
     public void ProcessReceivedData_WithValidMeasurementData_ShouldProcessSuccessfully()
@@ -202,65 +202,119 @@ public class InstrumentHostTests
     }
 
     [Fact]
-    public void ProcessReceivedData_WithIncompleteData_ShouldHandleGracefully()
+    public void ProcessReceivedData_WithFragmentedData_ShouldAccumulateAndProcess()
     {
         // Arrange
         var host = new InstrumentHost();
         var measurementCount = 0;
-        var incompleteData = new byte[] { 0x01, 0x02, 0x03 }; // Only 3 bytes, need at least 8
+        var validMessageData = CreateValidMeasurementMessageData();
         
+        // Capture console output to verify processing
         using var sw = new StringWriter();
         Console.SetOut(sw);
         
-        // Act
-        host.ProcessReceivedData(incompleteData, incompleteData.Length, ref measurementCount);
+        // Act - Send data in small fragments (like UART byte-by-byte)
+        for (int i = 0; i < validMessageData.Length; i++)
+        {
+            var singleByte = new byte[] { validMessageData[i] };
+            host.ProcessReceivedData(singleByte, 1, ref measurementCount);
+        }
         
         // Assert
-        Assert.Equal(0, measurementCount);
+        Assert.Equal(1, measurementCount);
         var output = sw.ToString();
-        Assert.Contains("Received incomplete data: 3 bytes (minimum 8 required)", output);
+        Assert.Contains("Measurement #1", output);
+        Assert.Contains("samples: 3", output);
         
-        Console.SetOut(Console.Out);
-    }
-
-    [Theory]
-    [InlineData(0)]
-    [InlineData(1)]
-    [InlineData(4)]
-    [InlineData(7)]
-    public void ProcessReceivedData_WithInsufficientBytes_ShouldRejectData(int dataLength)
-    {
-        // Arrange
-        var host = new InstrumentHost();
-        var measurementCount = 0;
-        var insufficientData = new byte[dataLength];
-        
-        using var sw = new StringWriter();
-        Console.SetOut(sw);
-        
-        // Act
-        host.ProcessReceivedData(insufficientData, dataLength, ref measurementCount);
-        
-        // Assert
-        Assert.Equal(0, measurementCount);
-        var output = sw.ToString();
-        Assert.Contains($"Received incomplete data: {dataLength} bytes (minimum 8 required)", output);
-        
+        // Restore console
         Console.SetOut(Console.Out);
     }
 
     [Fact]
-    public void ProcessReceivedData_WithCorruptedFlatBufferData_ShouldHandleException()
+    public void ProcessReceivedData_WithMultipleFragmentedMessages_ShouldProcessAll()
     {
         // Arrange
         var host = new InstrumentHost();
         var measurementCount = 0;
-        var corruptedData = new byte[50]; // Enough bytes but invalid FlatBuffer structure
-        // Fill with random data that's not a valid FlatBuffer
-        for (int i = 0; i < corruptedData.Length; i++)
+        var message1 = CreateValidMeasurementMessageData();
+        var message2 = CreateValidMeasurementMessageData();
+        
+        // Combine both messages into one buffer
+        var combinedData = new byte[message1.Length + message2.Length];
+        Array.Copy(message1, 0, combinedData, 0, message1.Length);
+        Array.Copy(message2, 0, combinedData, message1.Length, message2.Length);
+        
+        // Capture console output to verify processing
+        using var sw = new StringWriter();
+        Console.SetOut(sw);
+        
+        // Act - Send combined data in random-sized fragments
+        var random = new Random(42); // Fixed seed for reproducible tests
+        var offset = 0;
+        while (offset < combinedData.Length)
         {
-            corruptedData[i] = (byte)(i % 256);
+            var fragmentSize = Math.Min(random.Next(1, 10), combinedData.Length - offset);
+            var fragment = new byte[fragmentSize];
+            Array.Copy(combinedData, offset, fragment, 0, fragmentSize);
+            host.ProcessReceivedData(fragment, fragmentSize, ref measurementCount);
+            offset += fragmentSize;
         }
+        
+        // Assert
+        Assert.Equal(2, measurementCount);
+        var output = sw.ToString();
+        Assert.Contains("Measurement #1", output);
+        Assert.Contains("Measurement #2", output);
+        
+        // Restore console
+        Console.SetOut(Console.Out);
+    }
+
+    [Fact]
+    public void ProcessReceivedData_WithPartialMessage_ShouldWaitForComplete()
+    {
+        // Arrange
+        var host = new InstrumentHost();
+        var measurementCount = 0;
+        var validMessageData = CreateValidMeasurementMessageData();
+        
+        // Capture console output to verify processing
+        using var sw = new StringWriter();
+        Console.SetOut(sw);
+        
+        // Act - Send only part of the message
+        var partialData = new byte[validMessageData.Length / 2];
+        Array.Copy(validMessageData, partialData, partialData.Length);
+        host.ProcessReceivedData(partialData, partialData.Length, ref measurementCount);
+        
+        // Assert - Should not process yet
+        Assert.Equal(0, measurementCount);
+        
+        // Act - Send the rest of the message
+        var remainingData = new byte[validMessageData.Length - partialData.Length];
+        Array.Copy(validMessageData, partialData.Length, remainingData, 0, remainingData.Length);
+        host.ProcessReceivedData(remainingData, remainingData.Length, ref measurementCount);
+        
+        // Assert - Should now process the complete message
+        Assert.Equal(1, measurementCount);
+        var output = sw.ToString();
+        Assert.Contains("Measurement #1", output);
+        
+        // Restore console
+        Console.SetOut(Console.Out);
+    }
+
+    [Fact]
+    public void ProcessReceivedData_WithCorruptedSizePrefix_ShouldHandleGracefully()
+    {
+        // Arrange
+        var host = new InstrumentHost();
+        var measurementCount = 0;
+        
+        // Create data with an extremely large size prefix (corrupted)
+        var corruptedData = new byte[8];
+        BitConverter.GetBytes(0xFFFFFFFF).CopyTo(corruptedData, 0); // Very large size prefix
+        BitConverter.GetBytes(0x12345678).CopyTo(corruptedData, 4); // Some additional data
         
         using var sw = new StringWriter();
         Console.SetOut(sw);
@@ -271,38 +325,93 @@ public class InstrumentHostTests
         // Assert
         Assert.Equal(0, measurementCount);
         var output = sw.ToString();
-        // With the new validation, corrupted data is caught before parsing
-        Assert.Contains("Received invalid FlatBuffer data", output);
+        Assert.Contains("size prefix too large", output);
         
         Console.SetOut(Console.Out);
     }
 
     [Fact]
-    public void ProcessReceivedData_WithBufferSizeMismatch_ShouldHandleCorrectly()
+    public void ProcessReceivedData_WithInsufficientDataForSizePrefix_ShouldWaitForMore()
     {
-        // This test specifically covers the original issue where we passed a larger buffer
-        // but only had valid data in the first part
+        // Arrange
+        var host = new InstrumentHost();
+        var measurementCount = 0;
+        var incompleteData = new byte[] { 0x01, 0x02, 0x03 }; // Only 3 bytes, need 4 for size prefix
         
+        using var sw = new StringWriter();
+        Console.SetOut(sw);
+        
+        // Act
+        host.ProcessReceivedData(incompleteData, incompleteData.Length, ref measurementCount);
+        
+        // Assert - Should not process or fail, just wait for more data
+        Assert.Equal(0, measurementCount);
+        var output = sw.ToString();
+        // Should not contain error messages since we're just waiting for more data
+        Assert.DoesNotContain("Error", output);
+        Assert.DoesNotContain("Invalid", output);
+        
+        Console.SetOut(Console.Out);
+    }
+
+    [Fact]
+    public void ProcessReceivedData_WithValidSizePrefixButInsufficientData_ShouldWaitForComplete()
+    {
         // Arrange
         var host = new InstrumentHost();
         var measurementCount = 0;
         var validMessageData = CreateValidMeasurementMessageData();
         
-        // Create a larger buffer and copy valid data to the beginning
-        var largerBuffer = new byte[4096]; // Simulate the original 4KB buffer
-        Array.Copy(validMessageData, largerBuffer, validMessageData.Length);
+        // Create data with correct size prefix but insufficient message data
+        var sizePrefix = BitConverter.GetBytes((uint)(validMessageData.Length - 4)); // Correct size prefix
+        var partialMessage = new byte[10]; // Only 10 bytes of message data
+        var incompleteData = new byte[sizePrefix.Length + partialMessage.Length];
+        sizePrefix.CopyTo(incompleteData, 0);
+        partialMessage.CopyTo(incompleteData, sizePrefix.Length);
         
         using var sw = new StringWriter();
         Console.SetOut(sw);
         
-        // Act - pass only the valid data length, not the full buffer size
-        host.ProcessReceivedData(largerBuffer, validMessageData.Length, ref measurementCount);
+        // Act
+        host.ProcessReceivedData(incompleteData, incompleteData.Length, ref measurementCount);
+        
+        // Assert - Should not process yet, waiting for complete message
+        Assert.Equal(0, measurementCount);
+        var output = sw.ToString();
+        // Should not contain error messages since we're just waiting for more data
+        Assert.DoesNotContain("Error", output);
+        Assert.DoesNotContain("Invalid", output);
+        
+        Console.SetOut(Console.Out);
+    }
+
+    [Fact]
+    public void ProcessReceivedData_WithInvalidFlatBufferStructure_ShouldLogInvalidData()
+    {
+        // Arrange
+        var host = new InstrumentHost();
+        var measurementCount = 0;
+        
+        // Create data with valid size prefix but invalid FlatBuffer structure
+        var invalidMessageSize = 50;
+        var sizePrefix = BitConverter.GetBytes((uint)invalidMessageSize);
+        var invalidMessageData = new byte[invalidMessageSize];
+        Array.Fill(invalidMessageData, (byte)0xFF); // Fill with invalid data
+        
+        var completeInvalidData = new byte[4 + invalidMessageSize];
+        sizePrefix.CopyTo(completeInvalidData, 0);
+        invalidMessageData.CopyTo(completeInvalidData, 4);
+        
+        using var sw = new StringWriter();
+        Console.SetOut(sw);
+        
+        // Act
+        host.ProcessReceivedData(completeInvalidData, completeInvalidData.Length, ref measurementCount);
         
         // Assert
-        Assert.Equal(1, measurementCount);
+        Assert.Equal(0, measurementCount);
         var output = sw.ToString();
-        Assert.Contains("Measurement #1", output);
-        Assert.DoesNotContain("Error parsing", output);
+        Assert.Contains("Received invalid FlatBuffer data", output);
         
         Console.SetOut(Console.Out);
     }
@@ -353,62 +462,33 @@ public class InstrumentHostTests
     }
 
     [Fact]
-    public void ProcessReceivedData_WithInvalidFlatBufferStructure_ShouldLogInvalidData()
+    public void ProcessReceivedData_WithBufferSizeMismatch_ShouldHandleCorrectly()
     {
+        // This test specifically covers the scenario where we pass a larger buffer
+        // but only have valid data in the first part
+        
         // Arrange
         var host = new InstrumentHost();
         var measurementCount = 0;
-        // Create data that has enough bytes but invalid FlatBuffer structure
-        var invalidData = new byte[100];
-        Array.Fill(invalidData, (byte)0xFF); // Fill with invalid data
-        
-        using var sw = new StringWriter();
-        Console.SetOut(sw);
-        
-        // Act
-        host.ProcessReceivedData(invalidData, invalidData.Length, ref measurementCount);
-        
-        // Assert
-        Assert.Equal(0, measurementCount);
-        var output = sw.ToString();
-        Assert.Contains("Received invalid FlatBuffer data", output);
-        Assert.Contains("Buffer details", output);
-        Assert.Contains("Hex:", output);
-        
-        Console.SetOut(Console.Out);
-    }
-
-    [Fact]
-    public void ProcessReceivedData_WithPartialMessage_ShouldLogInvalidData()
-    {
-        // Arrange
-        var host = new InstrumentHost();
-        var measurementCount = 0;
-        
-        // Create a valid message and then truncate it to simulate partial message
         var validMessageData = CreateValidMeasurementMessageData();
-        var partialData = new byte[validMessageData.Length / 2]; // Take only half
-        Array.Copy(validMessageData, partialData, partialData.Length);
+        
+        // Create a larger buffer and copy valid data to the beginning
+        var largerBuffer = new byte[4096]; // Simulate the original 4KB buffer
+        Array.Copy(validMessageData, largerBuffer, validMessageData.Length);
         
         using var sw = new StringWriter();
         Console.SetOut(sw);
         
-        // Act - This should not crash the application
-        host.ProcessReceivedData(partialData, partialData.Length, ref measurementCount);
+        // Act - pass only the valid data length, not the full buffer size
+        host.ProcessReceivedData(largerBuffer, validMessageData.Length, ref measurementCount);
         
         // Assert
+        Assert.Equal(1, measurementCount);
         var output = sw.ToString();
+        Assert.Contains("Measurement #1", output);
+        Assert.DoesNotContain("Error", output);
+        
         Console.SetOut(Console.Out);
-        
-        // The key test is that this doesn't crash - any reasonable error handling is acceptable
-        // Either it detects invalid data, insufficient data, or parsing error
-        Assert.True(
-            measurementCount == 0 || measurementCount == 1, // Could be 0 (error) or 1 (somehow valid)
-            "Measurement count should be reasonable"
-        );
-        
-        // And we should get some kind of output (either success or error message)
-        Assert.False(string.IsNullOrWhiteSpace(output), "Should produce some output");
     }
 
     // Helper methods to create test data

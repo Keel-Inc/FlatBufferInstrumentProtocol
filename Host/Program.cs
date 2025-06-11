@@ -10,6 +10,7 @@ using Google.FlatBuffers;
 using InstrumentProtocol;
 using System.Linq;
 using CommandLine;
+using System.Collections.Generic;
 
 [assembly: InternalsVisibleTo("Host.Tests")]
 
@@ -276,6 +277,7 @@ public class InstrumentHost
 {
     private readonly ICommunicator _communicator;
     private readonly CancellationTokenSource _cancellationTokenSource = new();
+    private readonly List<byte> _receiveBuffer = new(); // Buffer to accumulate incoming data
     
     // Constructor for testing
     internal InstrumentHost() 
@@ -430,40 +432,76 @@ public class InstrumentHost
     
     internal void ProcessReceivedData(byte[] buffer, int length, ref int measurementCount)
     {
+        // Add new data to our internal buffer
+        for (int i = 0; i < length; i++)
+        {
+            _receiveBuffer.Add(buffer[i]);
+        }
+        
+        // Process all complete messages from the buffer
+        while (TryProcessCompleteMessage(ref measurementCount))
+        {
+            // Continue processing until no more complete messages are available
+        }
+    }
+    
+    private bool TryProcessCompleteMessage(ref int measurementCount)
+    {
         try
         {
-            // Size-prefixed buffers need at least 4 bytes for the size prefix + minimum FlatBuffer data
-            if (length < 8) // 4 bytes for size prefix + 4 bytes minimum FlatBuffer
+            // Need at least 4 bytes for size prefix
+            if (_receiveBuffer.Count < 4)
             {
-                Console.WriteLine($"Received incomplete data: {length} bytes (minimum 8 required)");
-                _cancellationTokenSource.Cancel();
-                return;
+                return false; // Not enough data for size prefix
             }
             
             // Read the size prefix (first 4 bytes)
-            var sizePrefix = BitConverter.ToUInt32(buffer, 0);
+            var sizePrefix = BitConverter.ToUInt32(_receiveBuffer.ToArray(), 0);
             
-            // Validate size prefix is reasonable - if it's extremely large, it's likely corrupted data
-            if (sizePrefix > 1024 * 1024) // 1MB seems like a reasonable maximum for our protocol
+            // Validate size prefix is reasonable
+            if (sizePrefix > 1024 * 1024) // 1MB seems like a reasonable maximum
             {
-                Console.WriteLine($"Received invalid FlatBuffer data");
-                LogBufferDetails(buffer, length);
+                Console.WriteLine($"Received invalid FlatBuffer data - size prefix too large: {sizePrefix}");
+                LogBufferDetails(_receiveBuffer.ToArray(), _receiveBuffer.Count);
                 _cancellationTokenSource.Cancel();
-                return;
+                return false;
             }
             
-            // Validate that we have enough data for the complete message
+            // Calculate expected total message size
             var expectedTotalSize = 4 + (int)sizePrefix; // 4 bytes prefix + message size
-            if (length < expectedTotalSize)
+            
+            // Check if we have enough data for the complete message
+            if (_receiveBuffer.Count < expectedTotalSize)
             {
-                Console.WriteLine($"Received incomplete message: received {length} bytes, expected {expectedTotalSize} bytes");
-                _cancellationTokenSource.Cancel();
-                return;
+                return false; // Not enough data yet, wait for more
             }
             
+            // Extract the complete message
+            var messageData = _receiveBuffer.Take(expectedTotalSize).ToArray();
+            
+            // Remove the processed message from the buffer
+            _receiveBuffer.RemoveRange(0, expectedTotalSize);
+            
+            // Process the complete message
+            ProcessCompleteMessage(messageData, ref measurementCount);
+            
+            return true; // Successfully processed a message
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error processing message: {ex.Message}");
+            LogBufferDetails(_receiveBuffer.ToArray(), _receiveBuffer.Count);
+            _receiveBuffer.Clear(); // Clear corrupted buffer
+            _cancellationTokenSource.Cancel();
+            return false;
+        }
+    }
+    
+    private void ProcessCompleteMessage(byte[] messageData, ref int measurementCount)
+    {
+        try
+        {
             // Create a ByteBuffer with the complete message data (including size prefix)
-            var messageData = new byte[expectedTotalSize];
-            Array.Copy(buffer, messageData, expectedTotalSize);
             var byteBuffer = new ByteBuffer(messageData);
             
             // Use FlatBuffers verification methods for size-prefixed buffers
@@ -475,15 +513,15 @@ public class InstrumentHost
                 if (!isValidMessage)
                 {
                     Console.WriteLine($"Received invalid FlatBuffer data");
-                    LogBufferDetails(messageData, expectedTotalSize);
+                    LogBufferDetails(messageData, messageData.Length);
                     _cancellationTokenSource.Cancel();
                     return;
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                Console.WriteLine($"Received invalid FlatBuffer data");
-                LogBufferDetails(messageData, expectedTotalSize);
+                Console.WriteLine($"Received invalid FlatBuffer data: {ex.Message}");
+                LogBufferDetails(messageData, messageData.Length);
                 _cancellationTokenSource.Cancel();
                 return;
             }
@@ -517,10 +555,10 @@ public class InstrumentHost
                 Console.WriteLine($"Received unexpected message type: {message.MessageTypeType}");
             }
         }
-        catch (Exception)
+        catch (Exception ex)
         {
-            Console.WriteLine($"Received invalid FlatBuffer data");
-            LogBufferDetails(buffer, length);
+            Console.WriteLine($"Error processing complete message: {ex.Message}");
+            LogBufferDetails(messageData, messageData.Length);
             _cancellationTokenSource.Cancel();
         }
     }
@@ -539,42 +577,12 @@ public class InstrumentHost
             .Select(b => b >= 32 && b <= 126 ? (char)b : '.')
             .ToArray();
         Console.WriteLine($"  ASCII: {new string(printableChars)}");
-        
-        // Check if it looks like text data
-        var textBytes = data.Take(Math.Min(32, length)).Count(b => b >= 32 && b <= 126);
-        var textPercentage = (double)textBytes / Math.Min(32, length) * 100;
-        
-        if (textPercentage > 70)
-        {
-            Console.WriteLine($"  >> This appears to be TEXT data ({textPercentage:F0}% printable characters)");
-            
-            // Try to show as string
-            try
-            {
-                var textData = System.Text.Encoding.UTF8.GetString(data, 0, length);
-                Console.WriteLine($"  >> As text: '{textData}'");
-            }
-            catch
-            {
-                Console.WriteLine($"  >> Could not decode as UTF-8 text");
-            }
-        }
-        else
-        {
-            Console.WriteLine($"  >> This appears to be BINARY data ({textPercentage:F0}% printable characters)");
-        }
-        
+    
         // Check for common protocol patterns
         if (length >= 4)
         {
             var first4Bytes = BitConverter.ToUInt32(data, 0);
             Console.WriteLine($"  >> First 4 bytes as uint32: {first4Bytes} (0x{first4Bytes:X8})");
-            
-            // FlatBuffer messages typically start with a small offset (usually < 1000)
-            if (first4Bytes > 0 && first4Bytes < 1000)
-            {
-                Console.WriteLine($"  >> Could be FlatBuffer offset: {first4Bytes}");
-            }
         }
     }
     
