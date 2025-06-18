@@ -24,6 +24,7 @@ set(FLATCC_RUNTIME_DIR ${FLATCC_ROOT_DIR}/src/runtime)
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/InstrumentProtocol)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cff)
 include_directories(${FLATCC_INCLUDE_DIR})
 
 # FlatBuffers generated headers
@@ -43,10 +44,16 @@ set(FLATCC_RUNTIME_SOURCES
     ${FLATCC_RUNTIME_DIR}/refmap.c
 )
 
+# CFF source files
+set(CFF_SOURCES
+    cff/cff.c
+)
+
 # Source files
 set(INSTRUMENT_SOURCES
     instrument.c
     ${FLATCC_RUNTIME_SOURCES}
+    ${CFF_SOURCES}
 )
 
 # Create the instrument executable
@@ -66,6 +73,7 @@ set_target_properties(instrument PROPERTIES
 source_group("Source Files" FILES instrument.c)
 source_group("FlatBuffers Headers" FILES ${FLATBUFFERS_HEADERS})
 source_group("FlatCC Runtime" FILES ${FLATCC_RUNTIME_SOURCES})
+source_group("CFF" FILES ${CFF_SOURCES} cff/cff.h)
 
 # Set Visual Studio startup project
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT instrument)

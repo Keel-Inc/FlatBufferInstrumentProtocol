@@ -9,6 +9,7 @@
 
 #include "InstrumentProtocol/instrument_protocol_reader.h"
 #include "InstrumentProtocol/instrument_protocol_builder.h"
+#include "cff.h"
 
 #define PIPE_NAME "\\\\.\\pipe\\InstrumentProtocol"
 #define BUFFER_SIZE 4096
@@ -23,7 +24,14 @@ typedef struct {
     uint32_t sequence_number;
     HANDLE pipe_handle;
     flatcc_builder_t builder;
+    cff_frame_builder_t cff_builder;
+    uint8_t cff_frame_buffer[BUFFER_SIZE];
+    uint8_t cff_receive_buffer[BUFFER_SIZE * 2];
+    size_t cff_receive_buffer_used;
 } InstrumentState;
+
+// Global instrument state
+InstrumentState instrument_state = {0};
 
 // Generate simulated measurement data
 void generate_measurement_data(float* data, uint32_t sample_count) {
@@ -49,7 +57,7 @@ uint64_t get_timestamp_ms() {
 // Send a message through the named pipe
 bool send_message(InstrumentState* state, void* buffer, size_t size) {
     DWORD bytes_written;
-    BOOL success = WriteFile(state->pipe_handle, buffer, (DWORD)size, &bytes_written, NULL);
+    bool success = WriteFile(state->pipe_handle, buffer, (DWORD)size, &bytes_written, NULL);
     if (!success || bytes_written != size) {
         printf("Failed to send message: %lu\n", GetLastError());
         return false;
@@ -83,24 +91,35 @@ bool send_measurement(InstrumentState* state) {
     InstrumentProtocol_MessageType_union_ref_t message_type = 
         InstrumentProtocol_MessageType_as_Measurement(measurement);
     
-    // Create message as size-prefixed root
-    flatbuffers_buffer_ref_t buffer_ref = InstrumentProtocol_Message_create_as_root_with_size(
+    // Create message as
+    flatbuffers_buffer_ref_t buffer_ref = InstrumentProtocol_Message_create_as_root(
         &state->builder,
         message_type
     );
     
     if (!buffer_ref) {
-        printf("Failed to create size-prefixed message buffer\n");
+        printf("Failed to create message buffer\n");
         return false;
     }
     
     // Get the finalized buffer
-    void* buffer = flatcc_builder_get_direct_buffer(&state->builder, NULL);
-    size_t size = flatcc_builder_get_buffer_size(&state->builder);
+    void* flatbuffer_data = flatcc_builder_get_direct_buffer(&state->builder, NULL);
+    size_t flatbuffer_size = flatcc_builder_get_buffer_size(&state->builder);
     
-    printf("Sending measurement with %u samples (size-prefixed, %zu bytes)\n", 
-           sample_count, size);
-    return send_message(state, buffer, size);
+    // Build CFF frame around the FlatBuffer
+    cff_error_en_t cff_result = cff_build_frame(&state->cff_builder, (const uint8_t*)flatbuffer_data, flatbuffer_size);
+    
+    if (cff_result != cff_error_none) {
+        printf("Failed to build frame: %d\n", cff_result);
+        return false;
+    }
+    
+    // Calculate the frame size and send the frame
+    size_t frame_size = cff_calculate_frame_size_bytes(flatbuffer_size);
+    
+    printf("Sending measurement with %u samples (frame, %zu bytes payload, %zu bytes total)\n", 
+           sample_count, flatbuffer_size, frame_size);
+    return send_message(state, state->cff_frame_buffer, frame_size);
 }
 
 // Process received command message
@@ -160,32 +179,15 @@ void process_configuration(InstrumentState* state, InstrumentProtocol_Configurat
     printf("Configuration accepted\n");
 }
 
-// Process received message
-void process_message(InstrumentState* state, void* buffer, size_t size) {
-    // Check for minimum size-prefixed buffer size
-    if (size < sizeof(uint32_t) + 4) { // 4 bytes for size prefix + minimum FlatBuffer
-        printf("Error: Received buffer too small (%zu bytes) for size-prefixed message\n", size);
-        return;
-    }
+// Callback function for processing CFF frames
+void process_cff_frame(const cff_frame_t* frame) {
+    printf("Received frame %u with %zu byte payload\n", 
+           frame->header.frame_counter, frame->payload_size_bytes_bytes);
     
-    // Read the size prefix (first 4 bytes)
-    uint32_t message_size = *(uint32_t*)buffer;
-    printf("Received size-prefixed message: %u bytes payload, %zu bytes total\n", message_size, size);
-    
-    // Validate size prefix
-    if (sizeof(uint32_t) + message_size > size) {
-        printf("Error: Size prefix (%u) exceeds available data (%zu bytes total)\n", 
-               message_size, size);
-        return;
-    }
-    
-    // Skip the size prefix to get to the actual FlatBuffer message
-    void* message_buffer = (uint8_t*)buffer + sizeof(uint32_t);
-    
-    // Parse the message (now without the size prefix)
-    InstrumentProtocol_Message_table_t message = InstrumentProtocol_Message_as_root(message_buffer);
+    // Parse the FlatBuffer message from the frame payload
+    InstrumentProtocol_Message_table_t message = InstrumentProtocol_Message_as_root(frame->payload);
     if (!message) {
-        printf("Error: Failed to parse size-prefixed message\n");
+        printf("Error: Failed to parse FlatBuffer message from frame\n");
         return;
     }
     
@@ -195,11 +197,11 @@ void process_message(InstrumentState* state, void* buffer, size_t size) {
     // Process based on message type
     switch (message_type.type) {
         case InstrumentProtocol_MessageType_Command:
-            process_command(state, (InstrumentProtocol_Command_table_t)message_type.value);
+            process_command(&instrument_state, (InstrumentProtocol_Command_table_t)message_type.value);
             break;
             
         case InstrumentProtocol_MessageType_Configuration:
-            process_configuration(state, (InstrumentProtocol_Configuration_table_t)message_type.value);
+            process_configuration(&instrument_state, (InstrumentProtocol_Configuration_table_t)message_type.value);
             break;
             
         case InstrumentProtocol_MessageType_Measurement:
@@ -212,19 +214,50 @@ void process_message(InstrumentState* state, void* buffer, size_t size) {
     }
 }
 
+// Process received data buffer containing frames
+void process_received_data(void* buffer, size_t size) {
+    // Copy new data to receive buffer
+    if (instrument_state.cff_receive_buffer_used + size > sizeof(instrument_state.cff_receive_buffer)) {
+        printf("Warning: Receive buffer overflow, discarding old data\n");
+        instrument_state.cff_receive_buffer_used = 0;
+    }
+    
+    memcpy(instrument_state.cff_receive_buffer + instrument_state.cff_receive_buffer_used, buffer, size);
+    instrument_state.cff_receive_buffer_used += size;
+    
+    printf("Received %zu bytes, total buffer: %zu bytes\n", size, instrument_state.cff_receive_buffer_used);
+    
+    // Parse all complete frames
+    size_t consumed = cff_parse_frames(instrument_state.cff_receive_buffer, 
+                                      instrument_state.cff_receive_buffer_used, 
+                                      process_cff_frame);
+    
+    // Remove consumed data from buffer
+    if (consumed > 0) {
+        size_t remaining = instrument_state.cff_receive_buffer_used - consumed;
+        if (remaining > 0) {
+            memmove(instrument_state.cff_receive_buffer, 
+                   instrument_state.cff_receive_buffer + consumed, 
+                   remaining);
+        }
+        instrument_state.cff_receive_buffer_used = remaining;
+        printf("Consumed %zu bytes, %zu bytes remaining in buffer\n", consumed, remaining);
+    }
+}
+
 // Main measurement loop
-void measurement_loop(InstrumentState* state) {
+void measurement_loop(void) {
     printf("Starting measurement loop...\n");
     
     // Calculate sleep interval in milliseconds
-    DWORD sleep_ms = 1000 / state->measurements_per_second;
+    DWORD sleep_ms = 1000 / instrument_state.measurements_per_second;
     if (sleep_ms == 0) sleep_ms = 1;
     
-    while (state->running) {
+    while (instrument_state.running) {
         DWORD start_time = GetTickCount();
         
         // Send measurement
-        if (!send_measurement(state)) {
+        if (!send_measurement(&instrument_state)) {
             printf("Failed to send measurement - client may have disconnected\n");
             break;
         }
@@ -243,17 +276,23 @@ int main() {
     printf("Medical Instrument v1.0\n");
     printf("=============================\n");
     
-    InstrumentState state = {0};
-    
     // Initialize FlatBuffers builder
-    flatcc_builder_init(&state.builder);
+    flatcc_builder_init(&instrument_state.builder);
+    
+    // Initialize CFF frame builder
+    cff_error_en_t cff_result = cff_frame_builder_init(&instrument_state.cff_builder, 
+        instrument_state.cff_frame_buffer, sizeof(instrument_state.cff_frame_buffer));
+    if (cff_result != cff_error_none) {
+        printf("Error initializing CFF frame builder: %d\n", cff_result);
+        return 1;
+    }
     
     // Seed random number generator for simulated data
     srand((unsigned int)time(NULL));
     
     // Create named pipe
     printf("Creating named pipe: %s\n", PIPE_NAME);
-    state.pipe_handle = CreateNamedPipeA(
+    instrument_state.pipe_handle = CreateNamedPipeA(
         PIPE_NAME,
         PIPE_ACCESS_DUPLEX,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
@@ -264,7 +303,7 @@ int main() {
         NULL                  // default security
     );
     
-    if (state.pipe_handle == INVALID_HANDLE_VALUE) {
+    if (instrument_state.pipe_handle == INVALID_HANDLE_VALUE) {
         printf("Error creating named pipe: %lu\n", GetLastError());
         return 1;
     }
@@ -272,10 +311,10 @@ int main() {
     printf("Waiting for client connection...\n");
     
     // Wait for client to connect
-    BOOL connected = ConnectNamedPipe(state.pipe_handle, NULL);
+    bool connected = ConnectNamedPipe(instrument_state.pipe_handle, NULL);
     if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
         printf("Error connecting to client: %lu\n", GetLastError());
-        CloseHandle(state.pipe_handle);
+        CloseHandle(instrument_state.pipe_handle);
         return 1;
     }
     
@@ -286,7 +325,7 @@ int main() {
     char buffer[BUFFER_SIZE];
     while (true) {
         DWORD bytes_read;
-        BOOL success = ReadFile(state.pipe_handle, buffer, BUFFER_SIZE, &bytes_read, NULL);
+        bool success = ReadFile(instrument_state.pipe_handle, buffer, BUFFER_SIZE, &bytes_read, NULL);
         
         if (!success || bytes_read == 0) {
             DWORD error = GetLastError();
@@ -298,19 +337,19 @@ int main() {
             break;
         }
         
-        // Process the received message
-        process_message(&state, buffer, bytes_read);
+        // Process the received data containing frames
+        process_received_data(buffer, bytes_read);
         
         // If we received a start command and are configured, enter measurement loop
-        if (state.running && state.configured) {
-            measurement_loop(&state);
+        if (instrument_state.running && instrument_state.configured) {
+            measurement_loop();
         }
     }
     
     // Cleanup
     printf("Shutting down...\n");
-    flatcc_builder_clear(&state.builder);
-    CloseHandle(state.pipe_handle);
+    flatcc_builder_clear(&instrument_state.builder);
+    CloseHandle(instrument_state.pipe_handle);
     
     return 0;
 } 
