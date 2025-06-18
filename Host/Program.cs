@@ -11,6 +11,7 @@ using InstrumentProtocol;
 using System.Linq;
 using CommandLine;
 using System.Collections.Generic;
+using CompactFrameFormat;
 
 [assembly: InternalsVisibleTo("Host.Tests")]
 
@@ -277,12 +278,12 @@ public class InstrumentHost
 {
     private readonly ICommunicator _communicator;
     private readonly CancellationTokenSource _cancellationTokenSource = new();
-    private readonly List<byte> _receiveBuffer = new(); // Buffer to accumulate incoming data
-    
-    // Constructor for testing
+    private readonly List<byte> _receiveBuffer = new();
+    private ushort _frameCounter = 0;
+
     internal InstrumentHost() 
     { 
-        _communicator = null!; // For testing only
+        _communicator = null!;
     }
 
     public InstrumentHost(ICommunicator communicator)
@@ -356,7 +357,7 @@ public class InstrumentHost
             configOffset.Value
         );
         
-        builder.FinishSizePrefixed(messageOffset.Value);
+        builder.Finish(messageOffset.Value);
         
         await SendBufferAsync(builder.DataBuffer);
     }
@@ -380,25 +381,28 @@ public class InstrumentHost
             commandOffset.Value
         );
         
-        builder.FinishSizePrefixed(messageOffset.Value);
+        builder.Finish(messageOffset.Value);
         
         await SendBufferAsync(builder.DataBuffer);
     }
     
     private async Task SendBufferAsync(Google.FlatBuffers.ByteBuffer buffer)
     {
-        if (!_communicator.IsConnected)
+        if (!_communicator.IsConnected) {
             throw new InvalidOperationException("Not connected to instrument");
-            
-        var data = buffer.ToSizedArray();
-        await _communicator.WriteAsync(data, 0, data.Length, _cancellationTokenSource.Token);
+        }
+
+        var payload = buffer.ToSizedArray();
+        var frame = Cff.CreateFrame(payload, _frameCounter++);
+        await _communicator.WriteAsync(frame, 0, frame.Length, _cancellationTokenSource.Token);
         await _communicator.FlushAsync(_cancellationTokenSource.Token);
     }
     
     private async Task ReceiveMeasurementsAsync(CancellationToken cancellationToken)
     {
-        if (!_communicator.IsConnected)
+        if (!_communicator.IsConnected) {
             return;
+        }
             
         var buffer = new byte[4096];
         int measurementCount = 0;
@@ -438,96 +442,69 @@ public class InstrumentHost
             _receiveBuffer.Add(buffer[i]);
         }
         
-        // Process all complete messages from the buffer
-        while (TryProcessCompleteMessage(ref measurementCount))
-        {
-            // Continue processing until no more complete messages are available
-        }
+        ProcessAllFramesInBuffer(ref measurementCount);
     }
     
-    private bool TryProcessCompleteMessage(ref int measurementCount)
+    private void ProcessAllFramesInBuffer(ref int measurementCount)
     {
         try
         {
-            // Need at least 4 bytes for size prefix
-            if (_receiveBuffer.Count < 4)
+            var bufferArray = _receiveBuffer.ToArray();
+            
+            var foundFrames = Cff.FindFrames(bufferArray, out int consumedBytes);
+            
+            foreach (var frame in foundFrames)
             {
-                return false; // Not enough data for size prefix
+                try
+                {
+                    ProcessMessage(frame.Payload.ToArray(), ref measurementCount);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error processing frame: {ex.Message}");
+                }
             }
             
-            // Read the size prefix (first 4 bytes)
-            var sizePrefix = BitConverter.ToUInt32(_receiveBuffer.ToArray(), 0);
-            
-            // Validate size prefix is reasonable
-            if (sizePrefix > 1024 * 1024) // 1MB seems like a reasonable maximum
+            if (consumedBytes > 0)
             {
-                Console.WriteLine($"Received invalid FlatBuffer data - size prefix too large: {sizePrefix}");
-                LogBufferDetails(_receiveBuffer.ToArray(), _receiveBuffer.Count);
-                _cancellationTokenSource.Cancel();
-                return false;
+                _receiveBuffer.RemoveRange(0, consumedBytes);
             }
-            
-            // Calculate expected total message size
-            var expectedTotalSize = 4 + (int)sizePrefix; // 4 bytes prefix + message size
-            
-            // Check if we have enough data for the complete message
-            if (_receiveBuffer.Count < expectedTotalSize)
-            {
-                return false; // Not enough data yet, wait for more
-            }
-            
-            // Extract the complete message
-            var messageData = _receiveBuffer.Take(expectedTotalSize).ToArray();
-            
-            // Remove the processed message from the buffer
-            _receiveBuffer.RemoveRange(0, expectedTotalSize);
-            
-            // Process the complete message
-            ProcessCompleteMessage(messageData, ref measurementCount);
-            
-            return true; // Successfully processed a message
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error processing message: {ex.Message}");
-            LogBufferDetails(_receiveBuffer.ToArray(), _receiveBuffer.Count);
-            _receiveBuffer.Clear(); // Clear corrupted buffer
+            Console.WriteLine($"Error processing frames in buffer: {ex.Message}");
             _cancellationTokenSource.Cancel();
-            return false;
         }
     }
-    
-    private void ProcessCompleteMessage(byte[] messageData, ref int measurementCount)
+
+    private void ProcessMessage(byte[] messageData, ref int measurementCount)
     {
         try
         {
-            // Create a ByteBuffer with the complete message data (including size prefix)
+            // Create a ByteBuffer with the message data
             var byteBuffer = new ByteBuffer(messageData);
             
-            // Use FlatBuffers verification methods for size-prefixed buffers
+            // Verify FlatBuffer structure
             try
             {
                 var verifier = new Google.FlatBuffers.Verifier(byteBuffer);
-                bool isValidMessage = verifier.VerifyBuffer(null, true, MessageVerify.Verify);
+                bool isValidMessage = verifier.VerifyBuffer(null, false, MessageVerify.Verify);
                 
                 if (!isValidMessage)
                 {
-                    Console.WriteLine($"Received invalid FlatBuffer data");
+                    Console.WriteLine($"Received invalid FlatBuffer message data");
                     LogBufferDetails(messageData, messageData.Length);
-                    _cancellationTokenSource.Cancel();
                     return;
                 }
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Received invalid FlatBuffer data: {ex.Message}");
+                Console.WriteLine($"Received invalid FlatBuffer message data: {ex.Message}");
                 LogBufferDetails(messageData, messageData.Length);
-                _cancellationTokenSource.Cancel();
                 return;
             }
             
-            var bufferWithoutPrefix = Google.FlatBuffers.ByteBufferUtil.RemoveSizePrefix(byteBuffer);
-            var message = Message.GetRootAsMessage(bufferWithoutPrefix);
+            var message = Message.GetRootAsMessage(byteBuffer);
             
             if (message.MessageTypeType == MessageType.Measurement)
             {
@@ -557,9 +534,8 @@ public class InstrumentHost
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Error processing complete message: {ex.Message}");
+            Console.WriteLine($"Error processing message: {ex.Message}");
             LogBufferDetails(messageData, messageData.Length);
-            _cancellationTokenSource.Cancel();
         }
     }
     

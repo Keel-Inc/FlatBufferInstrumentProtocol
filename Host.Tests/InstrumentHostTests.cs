@@ -5,6 +5,7 @@ using Xunit;
 using Google.FlatBuffers;
 using InstrumentProtocol;
 using InstrumentProtocolHost;
+using CompactFrameFormat;
 
 namespace Host.Tests;
 
@@ -305,15 +306,15 @@ public class InstrumentHostTests
     }
 
     [Fact]
-    public void ProcessReceivedData_WithCorruptedSizePrefix_ShouldHandleGracefully()
+    public void ProcessReceivedData_WithCorruptedHeader_ShouldHandleGracefully()
     {
         // Arrange
         var host = new InstrumentHost();
         var measurementCount = 0;
         
-        // Create data with an extremely large size prefix (corrupted)
+        // Create data with invalid CFF preamble (corrupted)
         var corruptedData = new byte[8];
-        BitConverter.GetBytes(0xFFFFFFFF).CopyTo(corruptedData, 0); // Very large size prefix
+        BitConverter.GetBytes(0xDEADBEEF).CopyTo(corruptedData, 0); // Invalid preamble
         BitConverter.GetBytes(0x12345678).CopyTo(corruptedData, 4); // Some additional data
         
         using var sw = new StringWriter();
@@ -325,18 +326,19 @@ public class InstrumentHostTests
         // Assert
         Assert.Equal(0, measurementCount);
         var output = sw.ToString();
-        Assert.Contains("size prefix too large", output);
+        // Since the invalid preamble is handled silently, just verify no measurements were processed
+        // and no exceptions were thrown (which is the expected behavior)
         
         Console.SetOut(Console.Out);
     }
 
     [Fact]
-    public void ProcessReceivedData_WithInsufficientDataForSizePrefix_ShouldWaitForMore()
+    public void ProcessReceivedData_WithInsufficientDataForCffHeader_ShouldWaitForMore()
     {
         // Arrange
         var host = new InstrumentHost();
         var measurementCount = 0;
-        var incompleteData = new byte[] { 0x01, 0x02, 0x03 }; // Only 3 bytes, need 4 for size prefix
+        var incompleteData = new byte[] { 0xFA, 0xCE, 0x01, 0x02, 0x03 }; // Only 5 bytes, need 8 for CFF header
         
         using var sw = new StringWriter();
         Console.SetOut(sw);
@@ -355,19 +357,17 @@ public class InstrumentHostTests
     }
 
     [Fact]
-    public void ProcessReceivedData_WithValidSizePrefixButInsufficientData_ShouldWaitForComplete()
+    public void ProcessReceivedData_WithValidCffHeaderButInsufficientData_ShouldWaitForComplete()
     {
         // Arrange
         var host = new InstrumentHost();
         var measurementCount = 0;
-        var validMessageData = CreateValidMeasurementMessageData();
+        var validFrameData = CreateValidMeasurementMessageData();
         
-        // Create data with correct size prefix but insufficient message data
-        var sizePrefix = BitConverter.GetBytes((uint)(validMessageData.Length - 4)); // Correct size prefix
-        var partialMessage = new byte[10]; // Only 10 bytes of message data
-        var incompleteData = new byte[sizePrefix.Length + partialMessage.Length];
-        sizePrefix.CopyTo(incompleteData, 0);
-        partialMessage.CopyTo(incompleteData, sizePrefix.Length);
+        // Create data with valid CFF header but insufficient payload data
+        // Take only first 20 bytes of the complete frame (header + partial payload)
+        var incompleteData = new byte[20];
+        Array.Copy(validFrameData, incompleteData, Math.Min(20, validFrameData.Length));
         
         using var sw = new StringWriter();
         Console.SetOut(sw);
@@ -392,26 +392,21 @@ public class InstrumentHostTests
         var host = new InstrumentHost();
         var measurementCount = 0;
         
-        // Create data with valid size prefix but invalid FlatBuffer structure
-        var invalidMessageSize = 50;
-        var sizePrefix = BitConverter.GetBytes((uint)invalidMessageSize);
-        var invalidMessageData = new byte[invalidMessageSize];
-        Array.Fill(invalidMessageData, (byte)0xFF); // Fill with invalid data
-        
-        var completeInvalidData = new byte[4 + invalidMessageSize];
-        sizePrefix.CopyTo(completeInvalidData, 0);
-        invalidMessageData.CopyTo(completeInvalidData, 4);
+        // Create a CFF frame with invalid FlatBuffer payload
+        var invalidFlatBufferData = new byte[50];
+        Array.Fill(invalidFlatBufferData, (byte)0xFF); // Fill with invalid data
+        var invalidFrame = Cff.CreateFrame(invalidFlatBufferData, 0);
         
         using var sw = new StringWriter();
         Console.SetOut(sw);
         
         // Act
-        host.ProcessReceivedData(completeInvalidData, completeInvalidData.Length, ref measurementCount);
+        host.ProcessReceivedData(invalidFrame, invalidFrame.Length, ref measurementCount);
         
         // Assert
         Assert.Equal(0, measurementCount);
         var output = sw.ToString();
-        Assert.Contains("Received invalid FlatBuffer data", output);
+        Assert.Contains("Received invalid FlatBuffer message data", output);
         
         Console.SetOut(Console.Out);
     }
@@ -511,8 +506,9 @@ public class InstrumentHostTests
             measurementOffset.Value
         );
 
-        builder.FinishSizePrefixed(messageOffset.Value);
-        return builder.DataBuffer.ToSizedArray();
+        builder.Finish(messageOffset.Value);
+        var flatBufferData = builder.DataBuffer.ToSizedArray();
+        return Cff.CreateFrame(flatBufferData, 0); // Use frame counter 0 for test
     }
 
     private static byte[] CreateValidCommandMessageData()
@@ -524,8 +520,9 @@ public class InstrumentHostTests
             MessageType.Command,
             commandOffset.Value
         );
-        builder.FinishSizePrefixed(messageOffset.Value);
-        return builder.DataBuffer.ToSizedArray();
+        builder.Finish(messageOffset.Value);
+        var flatBufferData = builder.DataBuffer.ToSizedArray();
+        return Cff.CreateFrame(flatBufferData, 0); // Use frame counter 0 for test
     }
 
     private static byte[] CreateMeasurementMessageWithEmptyData()
@@ -546,8 +543,9 @@ public class InstrumentHostTests
             measurementOffset.Value
         );
 
-        builder.FinishSizePrefixed(messageOffset.Value);
-        return builder.DataBuffer.ToSizedArray();
+        builder.Finish(messageOffset.Value);
+        var flatBufferData = builder.DataBuffer.ToSizedArray();
+        return Cff.CreateFrame(flatBufferData, 0); // Use frame counter 0 for test
     }
 
     private static void CreateConfigurationMessage(FlatBufferBuilder builder, uint measurementsPerSecond, uint samplesPerMeasurement)
