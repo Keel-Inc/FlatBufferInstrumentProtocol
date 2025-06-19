@@ -26,6 +26,7 @@
 #include <string.h>
 #include "instrument_protocol_reader.h"
 #include "instrument_protocol_builder.h"
+#include "cff.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,7 +38,7 @@
 /* USER CODE BEGIN PD */
 #define DEVICE_ID "STM32Instrument_001"
 #define MAX_SAMPLES 100
-#define TX_BUFFER_SIZE 1024
+#define BUFFER_SIZE 256
 
 // Custom allocator memory pool sizes - reduced for STM32F100 (8KB RAM)
 #define VTABLE_POOL_SIZE 256
@@ -59,11 +60,9 @@
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-#define RX_BUFFER_SIZE 1024
-uint8_t rx_buffer[RX_BUFFER_SIZE];
+uint8_t tx_buffer[BUFFER_SIZE];
+uint8_t rx_buffer[BUFFER_SIZE];
 uint16_t rx_index = 0;
-bool message_size_received = false;
-uint32_t expected_message_size = 0;
 
 // Custom Memory Allocator - Static Memory Pools
 static uint8_t vtable_pool[VTABLE_POOL_SIZE];
@@ -115,10 +114,13 @@ typedef struct {
     flatcc_builder_t builder;
     uint32_t last_measurement_time;
     uint32_t measurement_interval_ms;
+    cff_frame_builder_t cff_builder;
+    uint8_t cff_frame_buffer[BUFFER_SIZE];
+    uint8_t cff_receive_buffer[BUFFER_SIZE * 2]; // Larger buffer for partial frames
+    size_t cff_receive_buffer_used;
 } InstrumentState;
 
 InstrumentState instrument_state = {0};
-uint8_t tx_buffer[TX_BUFFER_SIZE];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -276,26 +278,9 @@ uint64_t get_timestamp_ms() {
     return HAL_GetTick();
 }
 
-// Send a message through UART
-bool send_message(void* buffer, size_t size) {
-    // Create size-prefixed buffer
-    uint32_t total_size = sizeof(uint32_t) + size;
-    if (total_size > TX_BUFFER_SIZE) {
-        printf("Message with prefix too large (%lu bytes) for TX buffer\r\n", total_size);
-        return false;
-    }
-    
-    // Create a temporary buffer for size-prefixed message
-    uint8_t prefixed_buffer[TX_BUFFER_SIZE];
-    
-    // Add size prefix (first 4 bytes)
-    *(uint32_t*)prefixed_buffer = (uint32_t)size;
-    
-    // Copy the actual message data
-    memcpy(prefixed_buffer + sizeof(uint32_t), buffer, size);
-    
-    // Send the complete size-prefixed message
-    HAL_StatusTypeDef status = HAL_UART_Transmit(&huart1, prefixed_buffer, (uint16_t)total_size, 1000);
+// Send a frame through UART
+bool send_frame(void* buffer, size_t size) {
+    HAL_StatusTypeDef status = HAL_UART_Transmit(&huart1, (uint8_t*)buffer, (uint16_t)size, 1000);
     if (status != HAL_OK) {
         printf("UART transmission failed\r\n");
         return false;
@@ -337,22 +322,25 @@ bool send_measurement(InstrumentState* state) {
     
     // Get the buffer from custom emitter
     void* buffer;
-    size_t size;
-    buffer = custom_emitter_get_buffer(&custom_emit_context, &size);
-    if (!buffer || size == 0) {
+    size_t payload_size;
+    buffer = custom_emitter_get_buffer(&custom_emit_context, &payload_size);
+    if (!buffer || payload_size == 0) {
         printf("Failed to get buffer from custom emitter\r\n");
         return false;
     }
     
-    // Copy to TX buffer
-    if (size > TX_BUFFER_SIZE) {
-        printf("Error: Message too large for TX buffer (%u > %d)\r\n", size, TX_BUFFER_SIZE);
+    // Build frame
+    cff_error_en_t cff_result = cff_build_frame(&state->cff_builder, 
+        (const uint8_t*)buffer, payload_size);
+    
+    if (cff_result != cff_error_none) {
+        printf("Failed to build frame: %d\r\n", cff_result);
         return false;
     }
-    memcpy(tx_buffer, buffer, size);
     
-    bool result = send_message(tx_buffer, size);
-    
+    // Calculate the frame size and send
+    size_t frame_size = cff_calculate_frame_size_bytes(payload_size);
+    bool result = send_frame(state->cff_frame_buffer, frame_size);
     static bool first_time = true;
     if (result && first_time) {
         first_time = false;
@@ -362,49 +350,41 @@ bool send_measurement(InstrumentState* state) {
     return result;
 }
 
-// Log received packet information (simplified for now)
-void log_received_packet(void* buffer, size_t size) {
-    // Check for minimum size-prefixed buffer size
-    if (size < sizeof(uint32_t) + 4) { // 4 bytes for size prefix + minimum FlatBuffer
-        printf("Error: Received buffer too small (%u bytes) for size-prefixed message\r\n", size);
+// Callback function for processing frames
+void process_frame(const cff_frame_t* frame) {
+    // Parse the FlatBuffer message from the frame payload
+    InstrumentProtocol_Message_table_t message = InstrumentProtocol_Message_as_root(frame->payload);
+    if (!message) {
+        printf("Error: Failed to parse frame\r\n");
         return;
     }
     
-    // Read the size prefix (first 4 bytes)
-    uint32_t message_size = *(uint32_t*)buffer;
-    printf("Received size-prefixed message: %lu bytes payload, %u bytes total\r\n", message_size, size);
+    // Get message type
+    InstrumentProtocol_MessageType_union_type_t msg_type = InstrumentProtocol_Message_message_type_type(message);
     
-    // Validate size prefixf
-    if (sizeof(uint32_t) + message_size > size) {
-        printf("Error: Size prefix (%lu) exceeds available data (%u bytes total)\r\n", 
-               message_size, size);
-        return;
-    }
-    
-    // Get the FlatBuffer data
-    uint8_t* fb_data = (uint8_t*)buffer + sizeof(uint32_t);
-    
-    // Try to read as Message and determine type
-    InstrumentProtocol_Message_table_t msg = InstrumentProtocol_Message_as_root(fb_data);
-    if (msg) {
-        InstrumentProtocol_MessageType_union_type_t msg_type = InstrumentProtocol_Message_message_type_type(msg);
-        
-        switch (msg_type) {
-            case InstrumentProtocol_MessageType_Command:
-                printf("Received Command message\r\n");
-                break;
-            case InstrumentProtocol_MessageType_Configuration:
-                printf("Received Configuration message\r\n");
-                break;
-            case InstrumentProtocol_MessageType_Measurement:
-                printf("Received Measurement message\r\n");
-                break;
-            default:
-                printf("Received Unknown message type: %d\r\n", msg_type);
-                break;
+    // Process based on message type
+    switch (msg_type) {
+        case InstrumentProtocol_MessageType_Configuration: {
+            InstrumentProtocol_Configuration_table_t config = 
+                (InstrumentProtocol_Configuration_table_t)InstrumentProtocol_Message_message_type(message);
+            process_configuration(&instrument_state, config);
+            break;
         }
-    } else {
-        printf("Failed to parse message as FlatBuffer\r\n");
+        
+        case InstrumentProtocol_MessageType_Command: {
+            InstrumentProtocol_Command_table_t command = 
+                (InstrumentProtocol_Command_table_t)InstrumentProtocol_Message_message_type(message);
+            process_command(&instrument_state, command);
+            break;
+        }
+        
+        case InstrumentProtocol_MessageType_Measurement:
+            printf("Received measurement message (unexpected)\r\n");
+            break;
+            
+        default:
+            printf("Unknown message type: %d\r\n", msg_type);
+            break;
     }
 }
 
@@ -461,45 +441,7 @@ void process_command(InstrumentState* state, InstrumentProtocol_Command_table_t 
     }
 }
 
-// Process a complete FlatBuffer message
-void process_message(InstrumentState* state, void* buffer, size_t size) {
-    (void)size; // Unused parameter
-    
-    // Skip size prefix and get FlatBuffer data
-    uint8_t* fb_data = (uint8_t*)buffer + sizeof(uint32_t);
-    
-    InstrumentProtocol_Message_table_t msg = InstrumentProtocol_Message_as_root(fb_data);
-    if (!msg) {
-        printf("Failed to parse message\r\n");
-        return;
-    }
-    
-    InstrumentProtocol_MessageType_union_type_t msg_type = InstrumentProtocol_Message_message_type_type(msg);
-    
-    switch (msg_type) {
-        case InstrumentProtocol_MessageType_Configuration: {
-            InstrumentProtocol_Configuration_table_t config = 
-                (InstrumentProtocol_Configuration_table_t)InstrumentProtocol_Message_message_type(msg);
-            process_configuration(state, config);
-            break;
-        }
-        
-        case InstrumentProtocol_MessageType_Command: {
-            InstrumentProtocol_Command_table_t command = 
-                (InstrumentProtocol_Command_table_t)InstrumentProtocol_Message_message_type(msg);
-            process_command(state, command);
-            break;
-        }
-        
-        case InstrumentProtocol_MessageType_Measurement:
-            printf("Received measurement message (unexpected)\r\n");
-            break;
-            
-        default:
-            printf("Unknown message type: %d\r\n", msg_type);
-            break;
-    }
-}
+
 
 // Check if it's time to send a measurement
 void check_measurement_timing(InstrumentState* state) {
@@ -517,39 +459,29 @@ void check_measurement_timing(InstrumentState* state) {
     }
 }
 
-// Process received bytes to check for complete messages
-void process_received_bytes(void) {
-    // We need at least 4 bytes for the size prefix
-    if (rx_index < sizeof(uint32_t)) {
-        return;
+// Process received data buffer containing frames
+void process_received_data(void* buffer, size_t size) {
+    // Copy new data to receive buffer
+    if (instrument_state.cff_receive_buffer_used + size > sizeof(instrument_state.cff_receive_buffer)) {
+        printf("Warning: Receive buffer overflow, discarding old data\r\n");
+        instrument_state.cff_receive_buffer_used = 0;
     }
     
-    if (!message_size_received) {
-        // Read the expected message size from the first 4 bytes
-        expected_message_size = *(uint32_t*)rx_buffer;
-        message_size_received = true;
-        
-        // Sanity check on message size
-        if (expected_message_size > (RX_BUFFER_SIZE - sizeof(uint32_t))) {
-            printf("Error: Expected message size (%lu) too large for buffer\r\n", expected_message_size);
-            rx_index = 0;
-            message_size_received = false;
-            expected_message_size = 0;
-            return;
+    memcpy(instrument_state.cff_receive_buffer + instrument_state.cff_receive_buffer_used, buffer, size);
+    instrument_state.cff_receive_buffer_used += size;
+    
+    size_t consumed = cff_parse_frames(instrument_state.cff_receive_buffer, 
+                                      instrument_state.cff_receive_buffer_used, 
+                                      process_frame);
+    // Remove consumed data from buffer
+    if (consumed > 0) {
+        size_t remaining = instrument_state.cff_receive_buffer_used - consumed;
+        if (remaining > 0) {
+            memmove(instrument_state.cff_receive_buffer, 
+                   instrument_state.cff_receive_buffer + consumed, 
+                   remaining);
         }
-    }
-    
-    // Check if we have received the complete message
-    uint32_t total_expected_size = sizeof(uint32_t) + expected_message_size;
-    if (rx_index >= total_expected_size) {
-        // We have a complete message, process it
-        log_received_packet(rx_buffer, total_expected_size);
-        process_message(&instrument_state, rx_buffer, total_expected_size);
-        
-        // Reset for next message
-        rx_index = 0;
-        message_size_received = false;
-        expected_message_size = 0;
+        instrument_state.cff_receive_buffer_used = remaining;
     }
 }
 
@@ -605,7 +537,7 @@ int main(void)
   initialise_monitor_handles();
   
   // Initialize custom emitter with TX buffer
-  custom_emitter_init(&custom_emit_context, tx_buffer, TX_BUFFER_SIZE);
+  custom_emitter_init(&custom_emit_context, tx_buffer, BUFFER_SIZE);
   
   // Initialize FlatBuffers builder with custom allocator and emitter
   int init_result = flatcc_builder_custom_init(&instrument_state.builder,
@@ -616,14 +548,22 @@ int main(void)
     Error_Handler();
   }
   
-  printf("STM32 Instrument v1.0 - FlatBuffer Protocol (Custom Allocator)\r\n");
+  // Initialize CFF frame builder
+  cff_error_en_t cff_result = cff_frame_builder_init(&instrument_state.cff_builder, 
+      instrument_state.cff_frame_buffer, sizeof(instrument_state.cff_frame_buffer));
+  if (cff_result != cff_error_none) {
+    printf("Error: Failed to initialize CFF frame builder: %d\r\n", cff_result);
+    Error_Handler();
+  }
+  
+  printf("STM32 Instrument v1.0\r\n");
   printf("Device ID: %s\r\n", DEVICE_ID);
   printf("Memory pools initialized:\r\n");
   printf("  - VTable Stack: %d bytes\r\n", VTABLE_POOL_SIZE);
   printf("  - Data Stack: %d bytes\r\n", DATA_POOL_SIZE);
   printf("  - Builder Pool: %d bytes\r\n", BUILDER_POOL_SIZE);
   printf("  - Hash Table: %d bytes\r\n", HASH_POOL_SIZE);
-  printf("Ready to receive FlatBuffer messages...\r\n");
+  printf("Ready to receive messages...\r\n");
   printf("Send a Configuration message followed by a Start command to begin measurements.\r\n");
   /* USER CODE END 2 */
 
@@ -641,19 +581,14 @@ int main(void)
     uint8_t byte;
     if (HAL_UART_Receive(&huart1, &byte, 1, 1) == HAL_OK) {
       // Check for buffer overflow
-      if (rx_index >= RX_BUFFER_SIZE) {
+      if (rx_index >= BUFFER_SIZE) {
         printf("Error: RX buffer overflow, resetting\r\n");
         rx_index = 0;
-        message_size_received = false;
-        expected_message_size = 0;
         continue;
       }
       
-      // Add byte to buffer
       rx_buffer[rx_index++] = byte;
-      
-      // Process received bytes to check for complete messages
-      process_received_bytes();
+      process_received_data(rx_buffer + rx_index - 1, 1);
     }
   }
   /* USER CODE END 3 */

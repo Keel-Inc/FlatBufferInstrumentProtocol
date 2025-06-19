@@ -38,6 +38,7 @@ enable_language(C ASM)
 set(FLATCC_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../flatcc")
 set(FLATCC_LIB_DIR "${FLATCC_SOURCE_DIR}/lib")
 set(PROTOCOL_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/InstrumentProtocol")
+set(CFF_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cff")
 
 # Create an executable object type
 add_executable(${CMAKE_PROJECT_NAME})
@@ -48,19 +49,18 @@ add_subdirectory(cmake/stm32cubemx)
 # Link directories setup
 target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${FLATCC_LIB_DIR}
-    # Add user defined library search paths
 )
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user sources here
+    ${CFF_DIR}/cff.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${PROTOCOL_OUTPUT_DIR}
     ${FLATCC_SOURCE_DIR}/include
-    # Add user defined include paths
+    ${CFF_DIR}
 )
 
 # Add project symbols (macros)
@@ -73,5 +73,4 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
     flatccrt
     rdimon
-    # Add user defined libraries
 )
