@@ -74,11 +74,19 @@ extern "C" {
 //! @brief Maximum allowed payload size in bytes
 #define CFF_MAX_PAYLOAD_SIZE_BYTES 65535
 
+//! @brief Ring buffer element type (can be overridden by defining CFF_RB_T before including this header)
+#ifndef CFF_RB_T
+#define CFF_RB_T uint8_t
+#endif
+
 //! @brief CRC16 polynomial used for checksum calculation
 #define CFF_CRC_POLYNOMIAL 0x1021
 
 //! @brief Initial value for CRC16 calculation
 #define CFF_CRC_INIT 0xFFFF
+
+//! @brief Macro to find the minimum of two values
+#define CFF_MIN(a, b) ((a) < (b) ? (a) : (b))
 
 //! @}
 
@@ -96,7 +104,67 @@ typedef enum cff_error_en_t {
     cff_error_buffer_too_small,    //!< Provided buffer is too small
     cff_error_payload_too_large,   //!< Payload exceeds maximum allowed size
     cff_error_incomplete_frame,    //!< Frame data is incomplete
+    cff_error_insufficient_space,  //!< Insufficient space for ring buffer operation
 } cff_error_en_t;
+
+//! @}
+
+//! @defgroup cff_ring_buffer CFF Ring Buffer
+//! @brief Ring buffer operations for the Compact Frame Format
+//! @{
+
+//! @brief Ring buffer structure for circular buffer operations
+//!
+//! Used to manage a circular buffer with external storage. The buffer and size are provided during initialization.
+typedef struct cff_ring_buffer_t {
+    CFF_RB_T *buffer;       //!< Pointer to external buffer storage
+    uint32_t buffer_size;   //!< Size of the buffer in elements
+    uint32_t append_index;  //!< Index where next element will be appended
+    uint32_t consume_index; //!< Index where next element will be consumed
+    uint32_t free_space;    //!< Number of free elements in the buffer
+} cff_ring_buffer_t;
+
+//! @brief Initialize a ring buffer with external storage
+//!
+//! Initializes a ring buffer structure with the provided external buffer. The buffer and its size are managed by the
+//! client code.
+//!
+//! @param ring_buffer Pointer to ring buffer structure to initialize
+//! @param buffer Pointer to external buffer storage
+//! @param buffer_size Size of the buffer in elements
+//! @return cff_error_none on success, error code on failure
+cff_error_en_t cff_ring_buffer_init(cff_ring_buffer_t *ring_buffer, CFF_RB_T *buffer, uint32_t buffer_size);
+
+//! @brief Append elements to the ring buffer
+//!
+//! Appends the specified number of elements to the ring buffer.
+//!
+//! @param ring_buffer Pointer to initialized ring buffer
+//! @param items Pointer to elements to append
+//! @param number_of_items Number of elements to append
+//! @return cff_error_none on success, error code on failure
+cff_error_en_t cff_ring_buffer_append(cff_ring_buffer_t *ring_buffer, const CFF_RB_T *items, uint32_t number_of_items);
+
+//! @brief Consume elements from the ring buffer
+//!
+//! Consumes the specified number of elements from the ring buffer.
+//! Handles wrap-around automatically.
+//!
+//! @param ring_buffer Pointer to initialized ring buffer
+//! @param items Pointer to buffer to store consumed elements
+//! @param number_of_items Number of elements to consume
+//! @return cff_error_none on success, error code on failure
+cff_error_en_t cff_ring_buffer_consume(cff_ring_buffer_t *ring_buffer, CFF_RB_T *items, uint32_t number_of_items);
+
+//! @brief Advance the ring buffer consume index without copying data
+//!
+//! Advances the consume index by the specified number of elements without copying the data.
+//! This is more efficient when you need to discard data or advance past data that has already been processed.
+//!
+//! @param ring_buffer Pointer to initialized ring buffer
+//! @param number_of_items Number of elements to advance past
+//! @return cff_error_none on success, error code on failure
+cff_error_en_t cff_ring_buffer_advance(cff_ring_buffer_t *ring_buffer, uint32_t number_of_items);
 
 //! @}
 
@@ -104,10 +172,9 @@ typedef enum cff_error_en_t {
 //! @brief Structures used in the Compact Frame Format
 //! @{
 
-//! @brief CFF frame header structure
+//! @brief Frame header structure
 //!
-//! Contains all header fields of a CFF frame including preamble,
-//! frame counter, payload size, and header CRC.
+//! Contains all header fields of a frame including preamble, frame counter, payload size, and header CRC.
 typedef struct cff_header_t {
     uint8_t preamble[CFF_PREAMBLE_SIZE_BYTES]; //!< Frame preamble bytes
     uint16_t frame_counter;                    //!< Incremental frame counter
@@ -116,20 +183,22 @@ typedef struct cff_header_t {
                                                //!< payload size)
 } cff_header_t;
 
-//! @brief Complete CFF frame structure
+//! @brief Complete frame structure
 //!
-//! Represents a complete CFF frame with header, payload, and payload CRC.
-//! The payload field points to the actual payload data.
+//! Represents a complete frame with header, payload, and payload CRC.
+//! The payload field points to the payload data in the ring buffer.
+//! Use cff_copy_frame_payload() to copy payload data to a linear buffer.
 typedef struct cff_frame_t {
-    cff_header_t header;             //!< Frame header
-    const uint8_t *payload;          //!< Pointer to payload data
-    uint16_t payload_crc;            //!< CRC16 checksum of payload
-    size_t payload_size_bytes_bytes; //!< Size of payload in bytes
+    cff_header_t header;                  //!< Frame header
+    const uint8_t *payload;               //!< Pointer to payload data
+    uint16_t payload_crc;                 //!< CRC16 checksum of payload
+    size_t payload_size_bytes;            //!< Size of payload in bytes
+    const cff_ring_buffer_t *ring_buffer; //!< Pointer to the ring buffer
 } cff_frame_t;
 
-//! @brief Frame builder structure for constructing CFF frames
+//! @brief Frame builder structure for constructing frames
 //!
-//! Used to build CFF frames into a provided buffer. Maintains state in the form of the current frame counter.
+//! Used to build frames into a provided buffer. Maintains state in the form of the current frame counter.
 typedef struct cff_frame_builder_t {
     uint8_t *buffer;          //!< Buffer for frame construction
     size_t buffer_size_bytes; //!< Size of the buffer in bytes
@@ -158,6 +227,18 @@ typedef void (*cff_callback_t)(const cff_frame_t *frame);
 //! @return cff_error_none on success, error code on failure
 cff_error_en_t cff_crc16(const uint8_t *data, size_t data_size_bytes, uint16_t *crc);
 
+//! @brief Calculate CRC16 checksum for ring buffer data
+//!
+//! Calculates a CRC16 checksum for data in a ring buffer, handling wrap-around automatically.
+//!
+//! @param ring_buffer Pointer to ring buffer
+//! @param offset Offset in ring buffer where data starts
+//! @param data_size_bytes Length of data in bytes
+//! @param crc Pointer to store calculated CRC value
+//! @return cff_error_none on success, error code on failure
+cff_error_en_t cff_crc16_ring_buffer(const cff_ring_buffer_t *ring_buffer, uint32_t offset, size_t data_size_bytes,
+                                     uint16_t *crc);
+
 //! @brief Initialize a frame builder
 //!
 //! Initializes a frame builder with the provided buffer and sets the frame counter to zero.
@@ -168,9 +249,9 @@ cff_error_en_t cff_crc16(const uint8_t *data, size_t data_size_bytes, uint16_t *
 //! @return cff_error_none on success, error code on failure
 cff_error_en_t cff_frame_builder_init(cff_frame_builder_t *builder, uint8_t *buffer, size_t buffer_size_bytes);
 
-//! @brief Build a CFF frame with the given payload
+//! @brief Build a frame with the given payload
 //!
-//! Constructs a complete CFF frame in the builder's buffer, including header, payload, and all required CRC checksums.
+//! Constructs a complete frame in the builder's buffer, including header, payload, and all required CRC checksums.
 //! Automatically increments the frame counter.
 //!
 //! @param builder Pointer to initialized frame builder
@@ -179,30 +260,37 @@ cff_error_en_t cff_frame_builder_init(cff_frame_builder_t *builder, uint8_t *buf
 //! @return cff_error_none on success, error code on failure
 cff_error_en_t cff_build_frame(cff_frame_builder_t *builder, const uint8_t *payload, size_t payload_size_bytes);
 
-//! @brief Parse a single CFF frame from buffer
+//! @brief Parse a single frame from ring buffer
 //!
-//! Attempts to parse a complete CFF frame from the provided buffer.
+//! Attempts to parse a complete frame from the provided ring buffer.
 //! Validates preamble, header CRC, and payload CRC.
-//! Returns the number of bytes consumed from the buffer.
+//! Consumes the frame data from the ring buffer upon successful parsing.
 //!
-//! @param buffer Pointer to buffer containing frame data
-//! @param buffer_size_bytes Size of buffer in bytes
+//! @param ring_buffer Pointer to ring buffer containing frame data
 //! @param frame Pointer to frame structure to fill
-//! @param consumed_bytes Pointer to store number of bytes consumed
 //! @return cff_error_none on success, error code on failure
-cff_error_en_t cff_parse_frame(const uint8_t *buffer, size_t buffer_size_bytes, cff_frame_t *frame,
-                               size_t *consumed_bytes);
+cff_error_en_t cff_parse_frame(cff_ring_buffer_t *ring_buffer, cff_frame_t *frame);
 
-//! @brief Parse multiple CFF frames from buffer
+//! @brief Parse multiple frames from ring buffer
 //!
-//! Continuously parses CFF frames from the buffer, calling the provided callback function for each successfully parsed
-//! frame.
+//! Continuously parses frames from the ring buffer, calling the provided callback function for each successfully
+//! parsed frame. Consumes frame data from the ring buffer as frames are successfully parsed.
 //!
-//! @param buffer Pointer to buffer containing frame data
-//! @param buffer_size_bytes Size of buffer in bytes
+//! @param ring_buffer Pointer to ring buffer containing frame data
 //! @param callback Callback function to call for each parsed frame
-//! @return Number of bytes consumed from buffer
-size_t cff_parse_frames(const uint8_t *buffer, size_t buffer_size_bytes, cff_callback_t callback);
+//! @return Number of frames successfully parsed
+size_t cff_parse_frames(cff_ring_buffer_t *ring_buffer, cff_callback_t callback);
+
+//! @brief Copy frame payload data to a linear buffer
+//!
+//! Copies the payload data from a parsed frame (which may span ring buffer boundaries)
+//! into a contiguous linear buffer provided by the caller.
+//!
+//! @param frame Pointer to parsed frame structure
+//! @param buffer Pointer to destination buffer
+//! @param buffer_size Size of destination buffer in bytes
+//! @return cff_error_none on success, error code on failure
+cff_error_en_t cff_copy_frame_payload(const cff_frame_t *frame, uint8_t *buffer, size_t buffer_size);
 
 //! @}
 
@@ -212,14 +300,14 @@ size_t cff_parse_frames(const uint8_t *buffer, size_t buffer_size_bytes, cff_cal
 
 //! @brief Calculate total frame size for given payload size
 //!
-//! Calculates the total size of a CFF frame including header,
+//! Calculates the total size of a frame including header,
 //! payload, and payload CRC.
 //!
-//! @param payload_size_bytes_bytes Size of payload in bytes
+//! @param payload_size_bytes Size of payload in bytes
 //! @return Total frame size in bytes
-static inline size_t cff_calculate_frame_size_bytes(size_t payload_size_bytes_bytes)
+static inline size_t cff_calculate_frame_size_bytes(size_t payload_size_bytes)
 {
-    return CFF_HEADER_SIZE_BYTES + payload_size_bytes_bytes + CFF_PAYLOAD_CRC_SIZE_BYTES;
+    return CFF_HEADER_SIZE_BYTES + payload_size_bytes + CFF_PAYLOAD_CRC_SIZE_BYTES;
 }
 
 //! @brief Get the total size of a parsed frame
@@ -234,7 +322,7 @@ static inline size_t cff_get_frame_size_bytes_bytes(const cff_frame_t *frame)
     if (!frame) {
         return 0;
     }
-    return cff_calculate_frame_size_bytes(frame->payload_size_bytes_bytes);
+    return cff_calculate_frame_size_bytes(frame->payload_size_bytes);
 }
 
 //! @}

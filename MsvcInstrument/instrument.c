@@ -26,8 +26,8 @@ typedef struct {
     flatcc_builder_t builder;
     cff_frame_builder_t cff_builder;
     uint8_t cff_frame_buffer[BUFFER_SIZE];
+    cff_ring_buffer_t cff_ring_buffer;
     uint8_t cff_receive_buffer[BUFFER_SIZE * 2];
-    size_t cff_receive_buffer_used;
 } InstrumentState;
 
 // Global instrument state
@@ -182,7 +182,7 @@ void process_configuration(InstrumentState* state, InstrumentProtocol_Configurat
 // Callback function for processing CFF frames
 void process_cff_frame(const cff_frame_t* frame) {
     printf("Received frame %u with %zu byte payload\n", 
-           frame->header.frame_counter, frame->payload_size_bytes_bytes);
+           frame->header.frame_counter, frame->payload_size_bytes);
     
     // Parse the FlatBuffer message from the frame payload
     InstrumentProtocol_Message_table_t message = InstrumentProtocol_Message_as_root(frame->payload);
@@ -216,32 +216,20 @@ void process_cff_frame(const cff_frame_t* frame) {
 
 // Process received data buffer containing frames
 void process_received_data(void* buffer, size_t size) {
-    // Copy new data to receive buffer
-    if (instrument_state.cff_receive_buffer_used + size > sizeof(instrument_state.cff_receive_buffer)) {
-        printf("Warning: Receive buffer overflow, discarding old data\n");
-        instrument_state.cff_receive_buffer_used = 0;
+    printf("Received %zu bytes\n", size);
+    
+    // Append new data to ring buffer
+    cff_error_en_t result = cff_ring_buffer_append(&instrument_state.cff_ring_buffer, (const uint8_t*)buffer, (uint32_t)size);
+    if (result != cff_error_none) {
+        printf("Warning: Failed to append to ring buffer: %d\n", result);
+        return;
     }
     
-    memcpy(instrument_state.cff_receive_buffer + instrument_state.cff_receive_buffer_used, buffer, size);
-    instrument_state.cff_receive_buffer_used += size;
-    
-    printf("Received %zu bytes, total buffer: %zu bytes\n", size, instrument_state.cff_receive_buffer_used);
-    
     // Parse all complete frames
-    size_t consumed = cff_parse_frames(instrument_state.cff_receive_buffer, 
-                                      instrument_state.cff_receive_buffer_used, 
-                                      process_cff_frame);
+    size_t frames_parsed = cff_parse_frames(&instrument_state.cff_ring_buffer, process_cff_frame);
     
-    // Remove consumed data from buffer
-    if (consumed > 0) {
-        size_t remaining = instrument_state.cff_receive_buffer_used - consumed;
-        if (remaining > 0) {
-            memmove(instrument_state.cff_receive_buffer, 
-                   instrument_state.cff_receive_buffer + consumed, 
-                   remaining);
-        }
-        instrument_state.cff_receive_buffer_used = remaining;
-        printf("Consumed %zu bytes, %zu bytes remaining in buffer\n", consumed, remaining);
+    if (frames_parsed > 0) {
+        printf("Parsed %zu frames\n", frames_parsed);
     }
 }
 
@@ -284,6 +272,14 @@ int main() {
         instrument_state.cff_frame_buffer, sizeof(instrument_state.cff_frame_buffer));
     if (cff_result != cff_error_none) {
         printf("Error initializing CFF frame builder: %d\n", cff_result);
+        return 1;
+    }
+    
+    // Initialize CFF ring buffer
+    cff_result = cff_ring_buffer_init(&instrument_state.cff_ring_buffer, 
+        instrument_state.cff_receive_buffer, sizeof(instrument_state.cff_receive_buffer));
+    if (cff_result != cff_error_none) {
+        printf("Error initializing CFF ring buffer: %d\n", cff_result);
         return 1;
     }
     
